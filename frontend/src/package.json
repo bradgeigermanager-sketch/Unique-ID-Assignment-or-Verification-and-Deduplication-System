@@ -1,0 +1,4 @@
+bashcd frontend
+npm create vite@latest . -- --template react
+npm install axios tailwindcss postcss autoprefixer
+npx tailwindcss init -p
