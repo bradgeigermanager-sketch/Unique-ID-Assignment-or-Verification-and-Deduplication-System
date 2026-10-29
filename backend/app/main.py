@@ -32,5 +32,3 @@ async def root():
 @app.on_event("shutdown")
 async def shutdown_db():
     dag_service.close()
-
-四、React 前端实现
