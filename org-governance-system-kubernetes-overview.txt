@@ -1,0 +1,1051 @@
+以下是完整的 Kubernetes 部署配置，包括所有组件的 Deployment、Service、ConfigMap、Secret、Ingress、Helm Chart 等。
+
+一、目录结构
+k8s/
+├── base/
+│   ├── namespace.yaml
+│   ├── configmap.yaml
+│   ├── secret.yaml
+│   ├── neo4j/
+│   │   ├── deployment.yaml
+│   │   ├── service.yaml
+│   │   └── pvc.yaml
+│   ├── postgres/
+│   │   ├── deployment.yaml
+│   │   ├── service.yaml
+│   │   └── pvc.yaml
+│   ├── backend/
+│   │   ├── deployment.yaml
+│   │   ├── service.yaml
+│   │   └── hpa.yaml
+│   ├── frontend/
+│   │   ├── deployment.yaml
+│   │   └── service.yaml
+│   └── ingress.yaml
+├── overlays/
+│   ├── development/
+│   │   ├── kustomization.yaml
+│   │   └── replica-patch.yaml
+│   ├── staging/
+│   │   ├── kustomization.yaml
+│   │   └── replica-patch.yaml
+│   └── production/
+│       ├── kustomization.yaml
+│       ├── replica-patch.yaml
+│       └── resource-patch.yaml
+├── helm/
+│   └── org-governance/
+│       ├── Chart.yaml
+│       ├── values.yaml
+│       └── templates/
+└── scripts/
+    ├── deploy.sh
+    └── rollback.sh
+
+
+二、基础配置 (base/)
+1️⃣ 命名空间 (k8s/base/namespace.yaml)
+yamlapiVersion: v1
+kind: Namespace
+metadata:
+  name: org-governance
+  labels:
+    app: org-governance
+    environment: production
+2️⃣ ConfigMap (k8s/base/configmap.yaml)
+yamlapiVersion: v1
+kind: ConfigMap
+metadata:
+  name: org-governance-config
+  namespace: org-governance
+data:
+  # 后端配置
+  NEO4J_URI: "bolt://neo4j-service:7687"
+  NEO4J_USER: "neo4j"
+  NEO4J_PASSWORD: "change-me-in-secret"
+  DATABASE_URL: "postgresql://postgres:postgres@postgres-service:5432/hr_db"
+  FILE_UPLOAD_DIR: "/data/uploads"
+  LOG_LEVEL: "INFO"
+  MAX_WORKERS: "4"
+  
+  # 前端配置
+  REACT_APP_API_BASE: "/api"
+  
+  # 应用配置
+  APP_NAME: "org-governance-system"
+  APP_VERSION: "1.0.0"
+3️⃣ Secret (k8s/base/secret.yaml)
+yamlapiVersion: v1
+kind: Secret
+metadata:
+  name: org-governance-secrets
+  namespace: org-governance
+type: Opaque
+stringData:
+  # Neo4j 密码
+  NEO4J_PASSWORD: "secure-neo4j-password-2026"
+  
+  # PostgreSQL 密码
+  POSTGRES_PASSWORD: "secure-postgres-password-2026"
+  
+  # JWT 密钥
+  JWT_SECRET: "super-secret-jwt-key-change-in-production"
+  
+  # 数据库连接密码
+  DATABASE_PASSWORD: "secure-db-password-2026"
+  
+  # Redis 密码（如使用）
+  REDIS_PASSWORD: "secure-redis-password-2026"
+4️⃣ Neo4j 部署 (k8s/base/neo4j/deployment.yaml)
+yamlapiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: neo4j
+  namespace: org-governance
+  labels:
+    app: neo4j
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: neo4j
+  template:
+    metadata:
+      labels:
+        app: neo4j
+    spec:
+      containers:
+      - name: neo4j
+        image: neo4j:5.15
+        ports:
+        - containerPort: 7474
+          name: http
+        - containerPort: 7687
+          name: bolt
+        env:
+        - name: NEO4J_AUTH
+          valueFrom:
+            secretKeyRef:
+              name: org-governance-secrets
+              key: NEO4J_PASSWORD
+        - name: NEO4J_PLUGINS
+          value: '["apoc"]'
+        - name: NEO4J_dbms_memory_pagecache_size
+          value: "2G"
+        - name: NEO4J_dbms_memory_heap_initial_size
+          value: "2G"
+        resources:
+          requests:
+            memory: "2Gi"
+            cpu: "500m"
+          limits:
+            memory: "4Gi"
+            cpu: "2000m"
+        volumeMounts:
+        - name: neo4j-data
+          mountPath: /data
+        livenessProbe:
+          httpGet:
+            path: /dbms/admin/health
+            port: 7474
+          initialDelaySeconds: 60
+          periodSeconds: 30
+        readinessProbe:
+          httpGet:
+            path: /dbms/admin/health
+            port: 7474
+          initialDelaySeconds: 30
+          periodSeconds: 10
+      volumes:
+      - name: neo4j-data
+        persistentVolumeClaim:
+          claimName: neo4j-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: neo4j-service
+  namespace: org-governance
+spec:
+  selector:
+    app: neo4j
+  ports:
+  - name: http
+    port: 7474
+    targetPort: 7474
+  - name: bolt
+    port: 7687
+    targetPort: 7687
+  type: ClusterIP
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: neo4j-pvc
+  namespace: org-governance
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+  storageClassName: standard
+5️⃣ PostgreSQL 部署 (k8s/base/postgres/deployment.yaml)
+yamlapiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+  namespace: org-governance
+  labels:
+    app: postgres
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      containers:
+      - name: postgres
+        image: postgres:15
+        ports:
+        - containerPort: 5432
+        env:
+        - name: POSTGRES_USER
+          value: "hr_user"
+        - name: POSTGRES_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: org-governance-secrets
+              key: POSTGRES_PASSWORD
+        - name: POSTGRES_DB
+          value: "hr_db"
+        resources:
+          requests:
+            memory: "1Gi"
+            cpu: "500m"
+          limits:
+            memory: "2Gi"
+            cpu: "1000m"
+        volumeMounts:
+        - name: postgres-data
+          mountPath: /var/lib/postgresql/data
+        livenessProbe:
+          exec:
+            command:
+            - pg_isready
+            - -U
+            - hr_user
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          exec:
+            command:
+            - pg_isready
+            - -U
+            - hr_user
+          initialDelaySeconds: 10
+          periodSeconds: 5
+      volumes:
+      - name: postgres-data
+        persistentVolumeClaim:
+          claimName: postgres-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-service
+  namespace: org-governance
+spec:
+  selector:
+    app: postgres
+  ports:
+  - port: 5432
+    targetPort: 5432
+  type: ClusterIP
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-pvc
+  namespace: org-governance
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 20Gi
+  storageClassName: standard
+6️⃣ 后端部署 (k8s/base/backend/deployment.yaml)
+yamlapiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend
+  namespace: org-governance
+  labels:
+    app: backend
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: backend
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: backend
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+    spec:
+      containers:
+      - name: backend
+        image: ghcr.io/org-governance/backend:latest
+        ports:
+        - containerPort: 8000
+        env:
+        - name: NEO4J_URI
+          valueFrom:
+            configMapKeyRef:
+              name: org-governance-config
+              key: NEO4J_URI
+        - name: NEO4J_USER
+          valueFrom:
+            configMapKeyRef:
+              name: org-governance-config
+              key: NEO4J_USER
+        - name: NEO4J_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: org-governance-secrets
+              key: NEO4J_PASSWORD
+        - name: DATABASE_URL
+          valueFrom:
+            configMapKeyRef:
+              name: org-governance-config
+              key: DATABASE_URL
+        - name: FILE_UPLOAD_DIR
+          valueFrom:
+            configMapKeyRef:
+              name: org-governance-config
+              key: FILE_UPLOAD_DIR
+        - name: LOG_LEVEL
+          valueFrom:
+            configMapKeyRef:
+              name: org-governance-config
+              key: LOG_LEVEL
+        - name: MAX_WORKERS
+          valueFrom:
+            configMapKeyRef:
+              name: org-governance-config
+              key: MAX_WORKERS
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "250m"
+          limits:
+            memory: "1Gi"
+            cpu: "1000m"
+        volumeMounts:
+        - name: file-uploads
+          mountPath: /data/uploads
+        - name: tmp
+          mountPath: /tmp
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 10
+          periodSeconds: 5
+      volumes:
+      - name: file-uploads
+        persistentVolumeClaim:
+          claimName: file-uploads-pvc
+      - name: tmp
+        emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend-service
+  namespace: org-governance
+  labels:
+    app: backend
+spec:
+  selector:
+    app: backend
+  ports:
+  - port: 8000
+    targetPort: 8000
+    name: http
+  type: ClusterIP
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: backend-hpa
+  namespace: org-governance
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: backend
+  minReplicas: 3
+  maxReplicas: 10
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+      - type: Percent
+        value: 10
+        periodSeconds: 60
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies:
+      - type: Percent
+        value: 100
+        periodSeconds: 15
+      - type: Pods
+        value: 4
+        periodSeconds: 15
+      selectPolicy: Max
+7️⃣ 前端部署 (k8s/base/frontend/deployment.yaml)
+yamlapiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend
+  namespace: org-governance
+  labels:
+    app: frontend
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: frontend
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: frontend
+    spec:
+      containers:
+      - name: frontend
+        image: ghcr.io/org-governance/frontend:latest
+        ports:
+        - containerPort: 80
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "256Mi"
+            cpu: "500m"
+        livenessProbe:
+          httpGet:
+            path: /
+            port: 80
+          initialDelaySeconds: 10
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /
+            port: 80
+          initialDelaySeconds: 5
+          periodSeconds: 5
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend-service
+  namespace: org-governance
+  labels:
+    app: frontend
+spec:
+  selector:
+    app: frontend
+  ports:
+  - port: 80
+    targetPort: 80
+    name: http
+  type: ClusterIP
+8️⃣ Ingress 配置 (k8s/base/ingress.yaml)
+yamlapiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: org-governance-ingress
+  namespace: org-governance
+  annotations:
+    kubernetes.io/ingress.class: nginx
+    nginx.ingress.kubernetes.io/rewrite-target: /
+    nginx.ingress.kubernetes.io/proxy-body-size: "50m"
+    nginx.ingress.kubernetes.io/proxy-connect-timeout: "60"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "60"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "60"
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+spec:
+  tls:
+  - hosts:
+    - org-governance.example.com
+    - api.org-governance.example.com
+    secretName: org-governance-tls
+  rules:
+  - host: org-governance.example.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: frontend-service
+            port:
+              number: 80
+  - host: api.org-governance.example.com
+    http:
+      paths:
+      - path: /api
+        pathType: Prefix
+        backend:
+          service:
+            name: backend-service
+            port:
+              number: 8000
+9️⃣ 文件存储 PVC (k8s/base/file-uploads-pvc.yaml)
+yamlapiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: file-uploads-pvc
+  namespace: org-governance
+spec:
+  accessModes:
+    - ReadWriteMany  # 多副本需要
+  resources:
+    requests:
+      storage: 50Gi
+  storageClassName: nfs  # 或 ceph, efs 等
+
+三、环境覆盖层 (overlays/)
+1️⃣ 开发环境 (k8s/overlays/development/kustomization.yaml)
+yamlapiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: org-governance
+
+resources:
+- ../../base
+
+patches:
+- path: replica-patch.yaml
+
+configMapGenerator:
+- name: org-governance-config
+  behavior: merge
+  literals:
+  - LOG_LEVEL=DEBUG
+  - MAX_WORKERS=2
+2️⃣ 开发环境副本补丁 (k8s/overlays/development/replica-patch.yaml)
+yamlapiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend
+  namespace: org-governance
+spec:
+  replicas: 1
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend
+  namespace: org-governance
+spec:
+  replicas: 1
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: backend-hpa
+  namespace: org-governance
+spec:
+  minReplicas: 1
+  maxReplicas: 3
+3️⃣ 生产环境 (k8s/overlays/production/kustomization.yaml)
+yamlapiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: org-governance
+
+resources:
+- ../../base
+
+patches:
+- path: replica-patch.yaml
+- path: resource-patch.yaml
+
+configMapGenerator:
+- name: org-governance-config
+  behavior: merge
+  literals:
+  - LOG_LEVEL=INFO
+  - MAX_WORKERS=8
+4️⃣ 生产环境副本补丁 (k8s/overlays/production/replica-patch.yaml)
+yamlapiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend
+  namespace: org-governance
+spec:
+  replicas: 5
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend
+  namespace: org-governance
+spec:
+  replicas: 3
+5️⃣ 生产环境资源补丁 (k8s/overlays/production/resource-patch.yaml)
+yamlapiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend
+  namespace: org-governance
+spec:
+  template:
+    spec:
+      containers:
+      - name: backend
+        resources:
+          requests:
+            memory: "1Gi"
+            cpu: "500m"
+          limits:
+            memory: "2Gi"
+            cpu: "2000m"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend
+  namespace: org-governance
+spec:
+  template:
+    spec:
+      containers:
+      - name: frontend
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "200m"
+          limits:
+            memory: "512Mi"
+            cpu: "1000m"
+
+四、Helm Chart (helm/org-governance/)
+1️⃣ Chart.yaml
+yamlapiVersion: v2
+name: org-governance
+description: 组织治理与文件管理系统 Helm Chart
+type: application
+version: 1.0.0
+appVersion: "1.0.0"
+keywords:
+  - organization
+  - governance
+  - neo4j
+  - react
+maintainers:
+  - name: DevOps Team
+    email: devops@example.com
+2️⃣ values.yaml
+yaml# 命名空间
+namespace: org-governance
+
+# Neo4j
+neo4j:
+  enabled: true
+  image: neo4j:5.15
+  replicas: 1
+  resources:
+    requests:
+      memory: "2Gi"
+      cpu: "500m"
+    limits:
+      memory: "4Gi"
+      cpu: "2000m"
+  storage:
+    size: 10Gi
+    storageClass: standard
+
+# PostgreSQL
+postgres:
+  enabled: true
+  image: postgres:15
+  replicas: 1
+  resources:
+    requests:
+      memory: "1Gi"
+      cpu: "500m"
+    limits:
+      memory: "2Gi"
+      cpu: "1000m"
+  storage:
+    size: 20Gi
+    storageClass: standard
+
+# 后端
+backend:
+  enabled: true
+  image: ghcr.io/org-governance/backend:latest
+  replicas: 3
+  resources:
+    requests:
+      memory: "512Mi"
+      cpu: "250m"
+    limits:
+      memory: "1Gi"
+      cpu: "1000m"
+  hpa:
+    enabled: true
+    minReplicas: 3
+    maxReplicas: 10
+    cpuThreshold: 70
+    memoryThreshold: 80
+
+# 前端
+frontend:
+  enabled: true
+  image: ghcr.io/org-governance/frontend:latest
+  replicas: 2
+  resources:
+    requests:
+      memory: "128Mi"
+      cpu: "100m"
+    limits:
+      memory: "256Mi"
+      cpu: "500m"
+
+# Ingress
+ingress:
+  enabled: true
+  className: nginx
+  annotations:
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+  hosts:
+    - host: org-governance.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+          service: frontend
+    - host: api.org-governance.example.com
+      paths:
+        - path: /api
+          pathType: Prefix
+          service: backend
+  tls:
+    - hosts:
+        - org-governance.example.com
+        - api.org-governance.example.com
+      secretName: org-governance-tls
+
+# 文件存储
+fileStorage:
+  enabled: true
+  size: 50Gi
+  storageClass: nfs
+  accessMode: ReadWriteMany
+
+# 监控
+monitoring:
+  enabled: true
+  prometheus:
+    scrapeInterval: 15s
+3️⃣ Templates 目录
+helm/org-governance/templates/
+├── _helpers.tpl
+├── namespace.yaml
+├── configmap.yaml
+├── secret.yaml
+├── neo4j/
+│   ├── deployment.yaml
+│   ├── service.yaml
+│   └── pvc.yaml
+├── postgres/
+│   ├── deployment.yaml
+│   ├── service.yaml
+│   └── pvc.yaml
+├── backend/
+│   ├── deployment.yaml
+│   ├── service.yaml
+│   └── hpa.yaml
+├── frontend/
+│   ├── deployment.yaml
+│   └── service.yaml
+├── ingress.yaml
+└── NOTES.txt
+
+
+五、部署脚本
+1️⃣ 部署脚本 (k8s/scripts/deploy.sh)
+bash#!/bin/bash
+set -e
+
+# 颜色
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color
+
+# 配置
+NAMESPACE="${NAMESPACE:-org-governance}"
+ENVIRONMENT="${ENVIRONMENT:-production}"
+KUSTOMIZE_PATH="k8s/overlays/${ENVIRONMENT}"
+
+echo -e "${GREEN}========================================${NC}"
+echo -e "${GREEN}  组织治理系统部署脚本${NC}"
+echo -e "${GREEN}========================================${NC}"
+
+# 检查 kubectl
+if ! command -v kubectl &> /dev/null; then
+    echo -e "${RED}错误：kubectl 未安装${NC}"
+    exit 1
+fi
+
+# 检查 kustomize
+if ! command -v kustomize &> /dev/null; then
+    echo -e "${RED}错误：kustomize 未安装${NC}"
+    exit 1
+fi
+
+# 创建命名空间
+echo -e "\n${YELLOW}1. 创建命名空间...${NC}"
+kubectl create namespace ${NAMESPACE} --dry-run=client -o yaml | kubectl apply -f -
+
+# 应用配置
+echo -e "\n${YELLOW}2. 应用 Kustomize 配置...${NC}"
+kustomize build ${KUSTOMIZE_PATH} | kubectl apply -f -
+
+# 等待服务就绪
+echo -e "\n${YELLOW}3. 等待服务就绪...${NC}"
+sleep 10
+
+# 检查后端
+echo -e "\n${YELLOW}4. 检查后端服务...${NC}"
+kubectl rollout status deployment/backend -n ${NAMESPACE} --timeout=300s
+
+# 检查前端
+echo -e "\n${YELLOW}5. 检查前端服务...${NC}"
+kubectl rollout status deployment/frontend -n ${NAMESPACE} --timeout=300s
+
+# 检查 Neo4j
+echo -e "\n${YELLOW}6. 检查 Neo4j 服务...${NC}"
+kubectl rollout status deployment/neo4j -n ${NAMESPACE} --timeout=300s
+
+# 检查 PostgreSQL
+echo -e "\n${YELLOW}7. 检查 PostgreSQL 服务...${NC}"
+kubectl rollout status deployment/postgres -n ${NAMESPACE} --timeout=300s
+
+# 显示状态
+echo -e "\n${GREEN}========================================${NC}"
+echo -e "${GREEN}  部署完成！${NC}"
+echo -e "${GREEN}========================================${NC}"
+
+echo -e "\n${YELLOW}服务状态:${NC}"
+kubectl get pods -n ${NAMESPACE}
+
+echo -e "\n${YELLOW}Ingress 信息:${NC}"
+kubectl get ingress -n ${NAMESPACE}
+
+echo -e "\n${YELLOW}访问地址:${NC}"
+echo -e "  前端：https://org-governance.example.com"
+echo -e "  API:  https://api.org-governance.example.com/api"
+echo -e "  API 文档：https://api.org-governance.example.com/docs"
+2️⃣ 回滚脚本 (k8s/scripts/rollback.sh)
+bash#!/bin/bash
+set -e
+
+NAMESPACE="${NAMESPACE:-org-governance}"
+REVISION="${REVISION:-}"
+
+if [ -z "$REVISION" ]; then
+    echo "用法：./rollback.sh <revision>"
+    echo "示例：./rollback.sh 3"
+    exit 1
+fi
+
+echo "回滚到版本 ${REVISION}..."
+
+# 回滚后端
+kubectl rollout undo deployment/backend -n ${NAMESPACE} --to-revision=${REVISION}
+
+# 回滚前端
+kubectl rollout undo deployment/frontend -n ${NAMESPACE} --to-revision=${REVISION}
+
+# 等待回滚完成
+kubectl rollout status deployment/backend -n ${NAMESPACE} --timeout=300s
+kubectl rollout status deployment/frontend -n ${NAMESPACE} --timeout=300s
+
+echo "回滚完成！"
+
+六、Helm 部署
+1️⃣ 安装 Helm
+bash# 安装 Helm
+curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+
+# 添加仓库（如使用）
+helm repo add bitnami https://charts.bitnami.com/bitnami
+helm repo update
+2️⃣ 安装 Chart
+bash# 安装到开发环境
+helm install org-governance helm/org-governance \
+  --namespace org-governance \
+  --create-namespace \
+  --set environment=development
+
+# 安装到生产环境
+helm install org-governance helm/org-governance \
+  --namespace org-governance \
+  --create-namespace \
+  --set environment=production \
+  --set backend.replicas=5 \
+  --set frontend.replicas=3
+
+# 升级
+helm upgrade org-governance helm/org-governance \
+  --namespace org-governance \
+  --set backend.replicas=7
+
+# 查看状态
+helm status org-governance -n org-governance
+
+# 卸载
+helm uninstall org-governance -n org-governance
+
+七、监控与日志
+1️⃣ Prometheus 监控 (k8s/monitoring/prometheus.yaml)
+yamlapiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: backend-monitor
+  namespace: org-governance
+  labels:
+    app: backend
+spec:
+  selector:
+    matchLabels:
+      app: backend
+  endpoints:
+  - port: http
+    interval: 15s
+    path: /metrics
+  namespaceSelector:
+    matchNames:
+    - org-governance
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: neo4j-monitor
+  namespace: org-governance
+  labels:
+    app: neo4j
+spec:
+  selector:
+    matchLabels:
+      app: neo4j
+  endpoints:
+  - port: http
+    interval: 30s
+    path: /metrics
+  namespaceSelector:
+    matchNames:
+    - org-governance
+2️⃣ Grafana 仪表板
+yamlapiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboards
+  namespace: org-governance
+data:
+  neo4j-dashboard.json: |
+    {
+      "dashboard": {
+        "title": "Neo4j 监控",
+        "panels": [...]
+      }
+    }
+  backend-dashboard.json: |
+    {
+      "dashboard": {
+        "title": "后端服务监控",
+        "panels": [...]
+      }
+    }
+
+八、完整部署流程
+bash# 1. 克隆代码
+git clone <repo-url>
+cd org-governance-system
+
+# 2. 配置 kubectl
+kubectl config use-context <cluster-context>
+
+# 3. 部署到开发环境
+./k8s/scripts/deploy.sh
+export ENVIRONMENT=development
+
+# 4. 部署到生产环境
+export ENVIRONMENT=production
+./k8s/scripts/deploy.sh
+
+# 5. 验证部署
+kubectl get all -n org-governance
+
+# 6. 查看日志
+kubectl logs -f deployment/backend -n org-governance
+kubectl logs -f deployment/frontend -n org-governance
+
+# 7. 访问服务
+# 前端：https://org-governance.example.com
+# API 文档：https://api.org-governance.example.com/docs
+
+九、故障排查
+表格问题解决方案Pod 无法启动kubectl describe pod <pod-name> -n org-governance服务无法访问kubectl get svc -n org-governance 检查端口Neo4j 连接失败检查 Secret 中的密码是否正确存储挂载失败检查 PVC 和 StorageClass 配置Ingress 404检查 Ingress 配置和 TLS 证书
+
+如果你需要，我可以：
+
+提供完整的 Helm Chart 模板文件
+设计完整的监控告警规则
+生成安全加固配置（Pod Security Policy、Network Policy）
+
+感兴趣的话可以了解下如何配置生产环境的 SSL 证书和反向代理，或者如何进行系统压力测试和性能调优？
